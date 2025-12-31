@@ -232,20 +232,26 @@ def refresh_all(repos: List[str], do_fetch: bool = False) -> List[RepoStatus]:
 
 
 def open_github_desktop(repo_path: str) -> Tuple[bool, str]:
+    # Try `github .` CLI first
     try:
         p = subprocess.run(["github", "."], cwd=repo_path, capture_output=True)
         if p.returncode == 0:
             return True, "Opened in GitHub Desktop"
-        # Fallback for macOS
-        if platform.system() == "Darwin":
+    except FileNotFoundError:
+        pass  # Fall through to macOS fallback
+
+    # Fallback for macOS: use `open -a`
+    if platform.system() == "Darwin":
+        try:
             p = subprocess.run(
                 ["open", "-a", "GitHub Desktop", repo_path], capture_output=True
             )
             if p.returncode == 0:
                 return True, "Opened in GitHub Desktop"
-        return False, "`github` CLI not found"
-    except FileNotFoundError:
-        return False, "`github` CLI not found"
+        except FileNotFoundError:
+            pass
+
+    return False, "GitHub Desktop not found"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
