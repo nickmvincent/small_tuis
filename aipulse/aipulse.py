@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-aipulse — tiny TUI for checking AI coding assistant usage.
+aipulse — tiny TUI for checking AI coding assistant usage & rate limits.
 
 Monitors:
-  - Claude Code: tokens, messages, sessions from stats-cache.json
+  - Claude Code: tokens, messages, sessions + live rate limits via API
   - Gemini CLI: session count from tmp directory
   - Codex: session count from history.jsonl
 
@@ -17,16 +17,28 @@ Keys:
 
 import curses
 import json
-import os
 import time
+import urllib.request
+import urllib.error
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data structures
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class RateLimit:
+    name: str
+    utilization: float  # 0-100 percentage used
+    resets_at: Optional[str] = None  # ISO timestamp or human-readable
+
+    @property
+    def remaining(self) -> float:
+        return max(0, 100 - self.utilization)
 
 
 @dataclass
@@ -42,6 +54,9 @@ class ToolStats:
     today_sessions: int = 0
     today_messages: int = 0
     today_tokens: int = 0
+    # Rate limits
+    rate_limits: List[RateLimit] = field(default_factory=list)
+    rate_limit_error: Optional[str] = None
     # Extra info
     model: str = ""
     extra: Dict[str, str] = field(default_factory=dict)
@@ -51,8 +66,14 @@ class ToolStats:
     def status_char(self) -> str:
         if not self.available:
             return "?"
+        # Check rate limits
+        for rl in self.rate_limits:
+            if rl.utilization >= 90:
+                return "X"
+            if rl.utilization >= 70:
+                return "!"
         if self.today_messages > 0:
-            return "!"
+            return "*"
         return "~"
 
 
@@ -66,8 +87,110 @@ class AppState:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data Collection
+# API Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def fetch_json(url: str, headers: dict, timeout: float = 5.0) -> dict:
+    """Fetch JSON from URL with headers."""
+    req = urllib.request.Request(url, headers=headers)
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    return json.loads(resp.read())
+
+
+def parse_reset_time(iso_str: Optional[str]) -> str:
+    """Convert ISO timestamp to human-readable relative time."""
+    if not iso_str:
+        return ""
+    try:
+        # Parse ISO format
+        if "+" in iso_str:
+            iso_str = iso_str.split("+")[0]
+        if "." in iso_str:
+            iso_str = iso_str.split(".")[0]
+        dt = datetime.fromisoformat(iso_str.replace("Z", ""))
+        now = datetime.utcnow()
+        diff = dt - now
+
+        if diff.total_seconds() < 0:
+            return "now"
+        elif diff.total_seconds() < 3600:
+            return f"{int(diff.total_seconds() / 60)}m"
+        elif diff.total_seconds() < 86400:
+            return f"{int(diff.total_seconds() / 3600)}h"
+        else:
+            return f"{int(diff.total_seconds() / 86400)}d"
+    except Exception:
+        return iso_str[:16] if iso_str else ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude Code
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_claude_rate_limits() -> tuple[List[RateLimit], Optional[str]]:
+    """Fetch Claude rate limits from API."""
+    creds_path = Path.home() / ".claude" / ".credentials.json"
+    if not creds_path.exists():
+        return [], "no credentials"
+
+    try:
+        with open(creds_path) as f:
+            creds = json.load(f)
+
+        oauth = creds.get("claudeAiOauth", {})
+        token = oauth.get("accessToken")
+        expires_at = oauth.get("expiresAt", 0)
+
+        if not token:
+            return [], "no token"
+
+        # Check if expired
+        if expires_at and expires_at / 1000 < time.time():
+            return [], "token expired (run claude to refresh)"
+
+        # Fetch usage
+        data = fetch_json(
+            "https://api.anthropic.com/api/oauth/usage",
+            {
+                "Authorization": f"Bearer {token}",
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+        )
+
+        limits = []
+        if "five_hour" in data and data["five_hour"]:
+            fh = data["five_hour"]
+            limits.append(RateLimit(
+                name="5h limit",
+                utilization=fh.get("utilization", 0),
+                resets_at=parse_reset_time(fh.get("resets_at")),
+            ))
+        if "seven_day" in data and data["seven_day"]:
+            sd = data["seven_day"]
+            limits.append(RateLimit(
+                name="Weekly",
+                utilization=sd.get("utilization", 0),
+                resets_at=parse_reset_time(sd.get("resets_at")),
+            ))
+        if "seven_day_opus" in data and data["seven_day_opus"]:
+            op = data["seven_day_opus"]
+            if op.get("utilization", 0) > 0 or op.get("resets_at"):
+                limits.append(RateLimit(
+                    name="Opus",
+                    utilization=op.get("utilization", 0),
+                    resets_at=parse_reset_time(op.get("resets_at")),
+                ))
+
+        return limits, None
+
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return [], "token expired"
+        return [], f"HTTP {e.code}"
+    except Exception as e:
+        return [], str(e)[:30]
 
 
 def get_claude_stats() -> ToolStats:
@@ -127,18 +250,51 @@ def get_claude_stats() -> ToolStats:
         stats.extra["output_tokens"] = f"{total_out:,}"
         stats.extra["first_session"] = data.get("firstSessionDate", "")[:10]
 
-        # Calculate cache stats
-        cache_read = sum(u.get("cacheReadInputTokens", 0) for u in model_usage.values())
-        cache_create = sum(u.get("cacheCreationInputTokens", 0) for u in model_usage.values())
-        if cache_read > 0:
-            stats.extra["cache_read"] = f"{cache_read:,}"
-        if cache_create > 0:
-            stats.extra["cache_created"] = f"{cache_create:,}"
+        # Get rate limits
+        stats.rate_limits, stats.rate_limit_error = get_claude_rate_limits()
 
     except (json.JSONDecodeError, KeyError, IOError) as e:
         stats.error = str(e)
 
     return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_gemini_rate_limits() -> tuple[List[RateLimit], Optional[str]]:
+    """Try to get Gemini rate limits from Google AI API."""
+    creds_path = Path.home() / ".gemini" / "oauth_creds.json"
+    if not creds_path.exists():
+        return [], "no credentials"
+
+    try:
+        with open(creds_path) as f:
+            creds = json.load(f)
+
+        token = creds.get("access_token")
+        if not token:
+            return [], "no token"
+
+        # Try Google AI usage endpoint (may not exist)
+        # This is speculative - Google may not expose this
+        try:
+            data = fetch_json(
+                "https://generativelanguage.googleapis.com/v1beta/usage",
+                {"Authorization": f"Bearer {token}"},
+                timeout=3.0,
+            )
+            # Parse if successful
+            return [], None
+        except urllib.error.HTTPError:
+            return [], "no API"
+        except Exception:
+            return [], "no API"
+
+    except Exception as e:
+        return [], str(e)[:20]
 
 
 def get_gemini_stats() -> ToolStats:
@@ -175,12 +331,44 @@ def get_gemini_stats() -> ToolStats:
             if mtime >= today_start:
                 stats.today_sessions += 1
 
-        stats.extra["data_source"] = "session file count"
+        stats.extra["data_source"] = "session files"
+
+        # Try to get rate limits
+        stats.rate_limits, stats.rate_limit_error = get_gemini_rate_limits()
 
     except (IOError, OSError) as e:
         stats.error = str(e)
 
     return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Codex CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_codex_rate_limits() -> tuple[List[RateLimit], Optional[str]]:
+    """Try to get Codex/OpenAI rate limits."""
+    auth_path = Path.home() / ".codex" / "auth.json"
+    if not auth_path.exists():
+        return [], "no auth"
+
+    try:
+        with open(auth_path) as f:
+            creds = json.load(f)
+
+        tokens = creds.get("tokens", {})
+        access_token = tokens.get("access_token")
+        if not access_token:
+            return [], "no token"
+
+        # OpenAI doesn't expose rate limits via API for ChatGPT Plus users
+        # The rate limit info shown in Codex TUI comes from internal endpoints
+        # We'd need to reverse engineer their API which is fragile
+        return [], "no public API"
+
+    except Exception as e:
+        return [], str(e)[:20]
 
 
 def get_codex_stats() -> ToolStats:
@@ -241,6 +429,9 @@ def get_codex_stats() -> ToolStats:
 
         stats.extra["data_source"] = "history.jsonl"
 
+        # Try to get rate limits
+        stats.rate_limits, stats.rate_limit_error = get_codex_rate_limits()
+
     except (IOError, OSError) as e:
         stats.error = str(e)
 
@@ -278,9 +469,15 @@ def init_colors():
 def status_color(tool: ToolStats) -> int:
     if not tool.available:
         return curses.color_pair(C_DIM)
+    # Check rate limits first
+    for rl in tool.rate_limits:
+        if rl.utilization >= 90:
+            return curses.color_pair(C_BAD)
+        if rl.utilization >= 70:
+            return curses.color_pair(C_WARN)
     if tool.today_messages > 100 or tool.today_tokens > 100000:
         return curses.color_pair(C_WARN)
-    if tool.today_messages > 0:
+    if tool.today_messages > 0 or tool.rate_limits:
         return curses.color_pair(C_OK)
     return curses.color_pair(C_DIM)
 
@@ -294,6 +491,21 @@ def format_tokens(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.1f}K"
     return str(n)
+
+
+def draw_progress_bar(pct_remaining: float, width: int = 20) -> str:
+    """Draw a progress bar showing remaining capacity."""
+    filled = int(width * pct_remaining / 100)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def limit_color(rl: RateLimit) -> int:
+    """Get color for a rate limit based on utilization."""
+    if rl.utilization >= 90:
+        return curses.color_pair(C_BAD)
+    if rl.utilization >= 70:
+        return curses.color_pair(C_WARN)
+    return curses.color_pair(C_OK)
 
 
 def draw_overview(stdscr, state: AppState):
@@ -313,10 +525,9 @@ def draw_overview(stdscr, state: AppState):
     # Separator
     put(1, 0, "-" * (w - 1), curses.A_DIM)
 
-    # Tool list
-    list_start = 2
+    # Tool list - dynamic height per tool
+    y = 2
     for i, tool in enumerate(state.tools):
-        y = list_start + i * 3  # 3 lines per tool
         if y >= h - 3:
             break
 
@@ -331,30 +542,39 @@ def draw_overview(stdscr, state: AppState):
         if tool.model:
             name_line += f" ({tool.model})"
         put(y, 0, name_line[:w - 1], attr | curses.A_BOLD)
+        y += 1
 
         if not tool.available:
-            put(y + 1, 5, tool.error or "not available", curses.A_DIM)
-        else:
-            # Stats line
-            stats_parts = []
-            if tool.total_sessions > 0:
-                stats_parts.append(f"S:{tool.total_sessions}")
-            if tool.total_messages > 0:
-                stats_parts.append(f"M:{tool.total_messages}")
-            if tool.total_tokens > 0:
-                stats_parts.append(f"T:{format_tokens(tool.total_tokens)}")
-            put(y + 1, 5, " ".join(stats_parts), color)
+            put(y, 5, tool.error or "not available", curses.A_DIM)
+            y += 2
+            continue
 
-            # Today line
-            today_parts = []
-            if tool.today_sessions > 0:
-                today_parts.append(f"s:{tool.today_sessions}")
-            if tool.today_messages > 0:
-                today_parts.append(f"m:{tool.today_messages}")
-            if tool.today_tokens > 0:
-                today_parts.append(f"t:{format_tokens(tool.today_tokens)}")
-            if today_parts:
-                put(y + 2, 5, "today: " + " ".join(today_parts), curses.A_DIM)
+        # Rate limits (most important info)
+        if tool.rate_limits:
+            for rl in tool.rate_limits:
+                bar_width = min(15, w - 30)
+                bar = draw_progress_bar(rl.remaining, bar_width)
+                reset_str = f" (resets {rl.resets_at})" if rl.resets_at else ""
+                limit_str = f"{rl.name}: {bar} {rl.remaining:.0f}%{reset_str}"
+                put(y, 5, limit_str[:w - 6], limit_color(rl))
+                y += 1
+        elif tool.rate_limit_error:
+            put(y, 5, f"limits: {tool.rate_limit_error}", curses.A_DIM)
+            y += 1
+
+        # Stats line
+        stats_parts = []
+        if tool.total_sessions > 0:
+            stats_parts.append(f"S:{tool.total_sessions}")
+        if tool.total_messages > 0:
+            stats_parts.append(f"M:{tool.total_messages}")
+        if tool.total_tokens > 0:
+            stats_parts.append(f"T:{format_tokens(tool.total_tokens)}")
+        if stats_parts:
+            put(y, 5, " ".join(stats_parts), curses.A_DIM)
+            y += 1
+
+        y += 1  # Spacing between tools
 
     # Footer
     if state.last_msg:
@@ -389,6 +609,27 @@ def draw_detail(stdscr, tool: ToolStats, last_msg: str):
         put(y, 2, f"Model: {tool.model}")
         y += 1
 
+    # Rate limits section
+    y += 1
+    put(y, 2, "Rate Limits:", curses.A_BOLD)
+    y += 1
+    if tool.rate_limits:
+        for rl in tool.rate_limits:
+            bar_width = min(20, w - 35)
+            bar = draw_progress_bar(rl.remaining, bar_width)
+            put(y, 4, f"{rl.name:12} {bar} {rl.remaining:5.1f}% left", limit_color(rl))
+            y += 1
+            if rl.resets_at:
+                put(y, 18, f"resets in {rl.resets_at}", curses.A_DIM)
+                y += 1
+    elif tool.rate_limit_error:
+        put(y, 4, tool.rate_limit_error, curses.A_DIM)
+        y += 1
+    else:
+        put(y, 4, "No data", curses.A_DIM)
+        y += 1
+
+    # All time stats
     y += 1
     put(y, 2, "All time:", curses.A_BOLD)
     y += 1
@@ -402,6 +643,7 @@ def draw_detail(stdscr, tool: ToolStats, last_msg: str):
         put(y, 4, f"Tokens:    {tool.total_tokens:,}")
         y += 1
 
+    # Today stats
     y += 1
     put(y, 2, "Today:", curses.A_BOLD | color)
     y += 1
@@ -414,16 +656,16 @@ def draw_detail(stdscr, tool: ToolStats, last_msg: str):
         y += 1
 
     # Extra info
-    if tool.extra:
+    if tool.extra and y < h - 5:
         y += 1
         put(y, 2, "Details:", curses.A_BOLD)
         y += 1
         for key, val in tool.extra.items():
+            if y >= h - 3:
+                break
             label = key.replace("_", " ").title()
             put(y, 4, f"{label}: {val}")
             y += 1
-            if y >= h - 3:
-                break
 
     ts = time.strftime("%H:%M:%S", time.localtime(tool.updated_at))
     put(h - 2, 2, f"Updated: {ts}", curses.A_DIM)
