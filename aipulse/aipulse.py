@@ -347,32 +347,118 @@ def get_gemini_stats() -> ToolStats:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_codex_rate_limits() -> tuple[List[RateLimit], Optional[str]]:
-    """Try to get Codex/OpenAI rate limits."""
-    auth_path = Path.home() / ".codex" / "auth.json"
-    if not auth_path.exists():
-        return [], "no auth"
+def get_codex_session_data(codex_dir: Path) -> tuple[int, int, List[RateLimit], Optional[str]]:
+    """Parse Codex session files for token counts and rate limits."""
+    sessions_dir = codex_dir / "sessions"
+    if not sessions_dir.exists():
+        return 0, 0, [], "no sessions dir"
+
+    total_tokens = 0
+    today_tokens = 0
+    latest_rate_limits = []
+    latest_timestamp = ""
+    today = datetime.now().strftime("%Y-%m-%d")
 
     try:
-        with open(auth_path) as f:
-            creds = json.load(f)
+        # Find all session files, sorted by date (newest first)
+        # Structure: sessions/YYYY/MM/DD/*.jsonl
+        session_files = []
+        for year_dir in sorted(sessions_dir.iterdir(), reverse=True):
+            if not year_dir.is_dir():
+                continue
+            for month_dir in sorted(year_dir.iterdir(), reverse=True):
+                if not month_dir.is_dir():
+                    continue
+                for day_dir in sorted(month_dir.iterdir(), reverse=True):
+                    if not day_dir.is_dir():
+                        continue
+                    for f in sorted(day_dir.iterdir(), reverse=True):
+                        if f.suffix == ".jsonl":
+                            session_files.append(f)
 
-        tokens = creds.get("tokens", {})
-        access_token = tokens.get("access_token")
-        if not access_token:
-            return [], "no token"
+        # Process session files (limit to recent ones for performance)
+        for session_file in session_files[:50]:
+            try:
+                with open(session_file) as f:
+                    last_tokens = 0
+                    session_date = ""
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            if entry.get("type") != "event_msg":
+                                continue
+                            payload = entry.get("payload", {})
+                            if payload.get("type") != "token_count":
+                                continue
 
-        # OpenAI doesn't expose rate limits via API for ChatGPT Plus users
-        # The rate limit info shown in Codex TUI comes from internal endpoints
-        # We'd need to reverse engineer their API which is fragile
-        return [], "no public API"
+                            timestamp = entry.get("timestamp", "")
+
+                            # Get token info (last one wins - they accumulate)
+                            info = payload.get("info")
+                            if info:
+                                last_tokens = info.get("total_token_usage", {}).get("total_tokens", 0)
+                                session_date = timestamp[:10]
+
+                            # Get rate limits from most recent entry
+                            if timestamp > latest_timestamp:
+                                latest_timestamp = timestamp
+                                rate_limits_data = payload.get("rate_limits", {})
+                                if rate_limits_data:
+                                    latest_rate_limits = []
+                                    primary = rate_limits_data.get("primary", {})
+                                    if primary:
+                                        resets_at = primary.get("resets_at")
+                                        reset_str = ""
+                                        if resets_at:
+                                            diff = resets_at - time.time()
+                                            if diff > 0:
+                                                if diff < 3600:
+                                                    reset_str = f"{int(diff/60)}m"
+                                                else:
+                                                    reset_str = f"{int(diff/3600)}h"
+                                        latest_rate_limits.append(RateLimit(
+                                            name="5h limit",
+                                            utilization=primary.get("used_percent", 0),
+                                            resets_at=reset_str,
+                                        ))
+                                    secondary = rate_limits_data.get("secondary", {})
+                                    if secondary:
+                                        resets_at = secondary.get("resets_at")
+                                        reset_str = ""
+                                        if resets_at:
+                                            diff = resets_at - time.time()
+                                            if diff > 0:
+                                                days = int(diff / 86400)
+                                                if days > 0:
+                                                    reset_str = f"{days}d"
+                                                else:
+                                                    reset_str = f"{int(diff/3600)}h"
+                                        latest_rate_limits.append(RateLimit(
+                                            name="Weekly",
+                                            utilization=secondary.get("used_percent", 0),
+                                            resets_at=reset_str,
+                                        ))
+
+                        except json.JSONDecodeError:
+                            continue
+
+                    # Add this session's tokens to totals
+                    total_tokens += last_tokens
+                    if session_date == today:
+                        today_tokens += last_tokens
+            except IOError:
+                continue
+
+        return total_tokens, today_tokens, latest_rate_limits, None
 
     except Exception as e:
-        return [], str(e)[:20]
+        return 0, 0, [], str(e)[:30]
 
 
 def get_codex_stats() -> ToolStats:
-    """Parse Codex usage from ~/.codex/history.jsonl"""
+    """Parse Codex usage from session files and history."""
     stats = ToolStats(name="Codex CLI")
     codex_dir = Path.home() / ".codex"
 
@@ -380,60 +466,66 @@ def get_codex_stats() -> ToolStats:
         stats.error = "~/.codex not found"
         return stats
 
+    # Get session/message counts from history
     history_path = codex_dir / "history.jsonl"
-    if not history_path.exists():
-        stats.error = "history.jsonl not found"
-        return stats
+    if history_path.exists():
+        try:
+            sessions = set()
+            messages = 0
+            today_sessions = set()
+            today_messages = 0
+            today = datetime.now().strftime("%Y-%m-%d")
 
-    try:
-        sessions = set()
-        messages = 0
-        today_sessions = set()
-        today_messages = 0
-        today = datetime.now().strftime("%Y-%m-%d")
-
-        with open(history_path) as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                    session_id = entry.get("session_id", "")
-                    if session_id:
-                        sessions.add(session_id)
-                    messages += 1
-
-                    # Check if today
-                    ts = entry.get("timestamp", "")
-                    if ts and ts.startswith(today):
+            with open(history_path) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        session_id = entry.get("session_id", "")
                         if session_id:
-                            today_sessions.add(session_id)
-                        today_messages += 1
-                except json.JSONDecodeError:
-                    continue
+                            sessions.add(session_id)
+                        messages += 1
 
-        stats.available = True
-        stats.total_sessions = len(sessions)
-        stats.total_messages = messages
-        stats.today_sessions = len(today_sessions)
-        stats.today_messages = today_messages
+                        # Check if today (using ts field which is unix timestamp)
+                        ts = entry.get("ts", 0)
+                        if ts:
+                            entry_date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                            if entry_date == today:
+                                if session_id:
+                                    today_sessions.add(session_id)
+                                today_messages += 1
+                    except (json.JSONDecodeError, ValueError):
+                        continue
 
-        # Check config for model
-        config_path = codex_dir / "config.toml"
-        if config_path.exists():
+            stats.available = True
+            stats.total_sessions = len(sessions)
+            stats.total_messages = messages
+            stats.today_sessions = len(today_sessions)
+            stats.today_messages = today_messages
+        except IOError:
+            pass
+
+    # Get token counts and rate limits from session files
+    total_tokens, today_tokens, rate_limits, error = get_codex_session_data(codex_dir)
+    stats.total_tokens = total_tokens
+    stats.today_tokens = today_tokens
+    stats.rate_limits = rate_limits
+    if error and not rate_limits:
+        stats.rate_limit_error = error
+    stats.available = True
+
+    # Check config for model
+    config_path = codex_dir / "config.toml"
+    if config_path.exists():
+        try:
             with open(config_path) as f:
                 for line in f:
                     if line.startswith("model"):
                         stats.model = line.split("=")[1].strip().strip('"')
                         break
-
-        stats.extra["data_source"] = "history.jsonl"
-
-        # Try to get rate limits
-        stats.rate_limits, stats.rate_limit_error = get_codex_rate_limits()
-
-    except (IOError, OSError) as e:
-        stats.error = str(e)
+        except IOError:
+            pass
 
     return stats
 
