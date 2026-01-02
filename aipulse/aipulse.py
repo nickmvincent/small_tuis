@@ -129,6 +129,56 @@ def parse_reset_time(iso_str: Optional[str]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+
+def refresh_claude_token(creds_path: Path, refresh_token: str) -> Optional[str]:
+    """Refresh Claude OAuth token and update credentials file."""
+    try:
+        data = json.dumps({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLAUDE_CLIENT_ID,
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://console.anthropic.com/v1/oauth/token",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "aipulse/1.0",
+                "Accept": "application/json",
+            },
+        )
+        resp = urllib.request.urlopen(req, timeout=10)
+        result = json.loads(resp.read())
+
+        new_token = result.get("access_token")
+        new_refresh = result.get("refresh_token")
+        expires_in = result.get("expires_in", 28800)
+
+        if new_token:
+            # Update credentials file
+            with open(creds_path) as f:
+                creds = json.load(f)
+
+            creds["claudeAiOauth"]["accessToken"] = new_token
+            creds["claudeAiOauth"]["expiresAt"] = int((time.time() + expires_in) * 1000)
+            if new_refresh:
+                creds["claudeAiOauth"]["refreshToken"] = new_refresh
+
+            with open(creds_path, "w") as f:
+                json.dump(creds, f)
+
+            return new_token
+
+    except urllib.error.HTTPError as e:
+        # 400 = refresh token expired/invalid, need to re-auth
+        return None
+    except Exception:
+        return None
+
+
 def get_claude_rate_limits() -> tuple[List[RateLimit], Optional[str]]:
     """Fetch Claude rate limits from API."""
     creds_path = Path.home() / ".claude" / ".credentials.json"
@@ -141,14 +191,22 @@ def get_claude_rate_limits() -> tuple[List[RateLimit], Optional[str]]:
 
         oauth = creds.get("claudeAiOauth", {})
         token = oauth.get("accessToken")
+        refresh_token = oauth.get("refreshToken")
         expires_at = oauth.get("expiresAt", 0)
 
         if not token:
             return [], "no token"
 
-        # Check if expired
+        # Check if expired and try to refresh
         if expires_at and expires_at / 1000 < time.time():
-            return [], "token expired (run claude to refresh)"
+            if refresh_token:
+                new_token = refresh_claude_token(creds_path, refresh_token)
+                if new_token:
+                    token = new_token
+                else:
+                    return [], "re-auth needed (claude logout)"
+            else:
+                return [], "token expired"
 
         # Fetch usage
         data = fetch_json(
